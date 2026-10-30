@@ -663,26 +663,6 @@ Two events for the same item can arrive in the wrong order, for example after a 
 
 Example: version 7 arrives, then a retried version 6. Solr keeps 7 and ignores 6.
 
-## Sizing: collections, shards and replicas
-
-If you know Cosmos DB, the ideas map across like this:
-
-| Solr | Cosmos DB | Meaning |
-|---|---|---|
-| Collection | Container | One searchable set of documents, such as all stock items |
-| Shard | Physical partition | A slice of the collection's documents. Each document lives in exactly one shard |
-| Replica | Replica of a partition | A copy of one shard on another node, for availability and extra read capacity |
-
-The difference: Cosmos picks partitions and replicas for you. In Solr you choose the numbers.
-
-| Collection | Documents | Size | Shards x replicas | Why |
-|---|---|---|---|---|
-| `stock_item` | 6 million | about 12 GB (2 KB each, estimate) | 2 x 3 | 6 GB per shard, room to grow. 3 copies so one can be down for maintenance while another fails |
-| `part` | 1.2 million | about 2.5 GB | 1 x 3 | Small, copies for availability |
-| `location` | a few thousand | under 100 MB | 1 x 3 | Tiny, copies for availability |
-
-Three nodes hold the 6 cores of `stock_item` (2 per node), plus the small collections. A search goes to one replica of each shard and merges the answers. The numbers are estimates until a load test.
-
 ## 3. Searchable index strategy
 
 Goal: AB-1234/5, ab 1234 5 and ab12345 all find the same part.
