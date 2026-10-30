@@ -22,10 +22,6 @@
 10. **Sizing is an estimate**: about 2 KB per stock document, 2 shards with 3 replicas, 250 to 500 searches a second at peak. A load test confirms it.
 11. **Recovery times are designed, not proven.** The quarterly failover and restore drills prove the 5-minute RPO and 1-hour RTO.
 
-## Status of the design
-
-12. **The DDL has not been run on a real MariaDB server.** Demand and Stock Check tables in the ERD are proposed and are not in the DDL yet.
-
 
 # 1. Bounded Context
 
