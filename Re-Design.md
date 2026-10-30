@@ -49,8 +49,6 @@ flowchart LR
 
 # Inventory ERD: Aggregates, Child Entities and Lookups
 
-Four diagrams, same structure as the slides. Paste any block into a Mermaid viewer (GitHub, VS Code preview, mermaid.live).
-
 Key: PK primary key, FK foreign key, UK unique key. Lookups are the small code tables.
 
 ## 1. Overview
