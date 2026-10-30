@@ -1,5 +1,32 @@
 # EDR Redsign
 
+# Assumptions
+
+## Meaning of legacy data
+
+1. **Shelf life is an expiry date**, not a duration.
+2. **A serial number is unique per part**, not across all parts. So a serialised item has quantity 1.
+3. **The two cost columns are two currencies**: order currency and base currency. `RC` means reporting currency.
+4. **`BarCode` and `sStockBarCode` are the same thing** and merge into one `barcode`. Rows where they differ are flagged.
+5. **`AB-1234` and `AB1234` are the same part**, so the cleaned part number key is unique. Legacy duplicates are listed by the migration.
+
+## Business rules
+
+6. **Base is owned by the platform.** Inventory stores only `base_id`. Part is global.
+7. **Records are kept 7 years** after the item leaves stock.
+8. **Users at several bases can search across them.** Whether they see another base's stock is a business decision still to be made.
+
+## Targets that need a test
+
+9. **Search copies of part text can be up to 60 seconds old.** Quantity, location, condition and status are never stale.
+10. **Sizing is an estimate**: about 2 KB per stock document, 2 shards with 3 replicas, 250 to 500 searches a second at peak. A load test confirms it.
+11. **Recovery times are designed, not proven.** The quarterly failover and restore drills prove the 5-minute RPO and 1-hour RTO.
+
+## Status of the design
+
+12. **The DDL has not been run on a real MariaDB server.** Demand and Stock Check tables in the ERD are proposed and are not in the DDL yet.
+
+
 # 1. Bounded Context
 
 ```mermaid
@@ -26,7 +53,43 @@ flowchart LR
 
 # Inventory ERD: Aggregates, Child Entities and Lookups
 
-### 1. Part aggregate
+Four diagrams, same structure as the slides. Paste any block into a Mermaid viewer (GitHub, VS Code preview, mermaid.live).
+
+Key: PK primary key, FK foreign key, UK unique key. Lookups are the small code tables.
+
+## 1. Overview
+
+```mermaid
+erDiagram
+    part ||--o{ part_alternative : "has alternatives"
+    part ||--o{ part_ata : "has ATA refs"
+    part ||--o{ part_model : "fits models"
+    part_classification ||--o{ part : classifies
+    part_status ||--o{ part : "status of"
+    part ||--o{ stock_item : "which part"
+    location ||--o{ stock_item : "held at"
+    location_category ||--o{ location : categorises
+    stock_condition ||--o{ stock_item : ""
+    stock_ownership ||--o{ stock_item : ""
+    stock_status ||--o{ stock_item : ""
+    stock_category ||--o{ stock_item : ""
+    stock_item ||--o{ receipt_discrepancy : "has"
+    part ||--o{ demand_line : "requested part"
+    demand ||--o{ demand_line : "has lines"
+    demand_line ||--o{ demand_issue : "issued as"
+    demand_line ||--o{ picking_list_item : "picked as"
+    picking_list ||--o{ picking_list_item : "has items"
+    location ||--o{ stock_check : "counted at"
+    stock_check ||--o{ stock_check_line : "has lines"
+    part ||--o{ min_max_policy : "limits for"
+    location ||--o{ min_max_policy : "limits at"
+    stock_item }o..o{ movement_ledger_entry : "by id, no FK"
+    part }o..o{ audit_log : "by id, no FK"
+    location }o..o{ audit_log : "by id, no FK"
+    stock_item }o..o{ audit_log : "by id, no FK"
+```
+
+## 2. Part aggregate
 
 ```mermaid
 erDiagram
@@ -88,7 +151,7 @@ erDiagram
 
 Part is global: it has no base_id.
 
-### 2. Location and stock item aggregates
+## 3. Location and stock item aggregates
 
 ```mermaid
 erDiagram
@@ -100,7 +163,18 @@ erDiagram
     stock_ownership ||--o{ stock_item : ""
     stock_status ||--o{ stock_item : ""
     stock_category ||--o{ stock_item : ""
+    stock_item ||--o{ receipt_discrepancy : "has"
 
+    receipt_discrepancy {
+        bigint receipt_discrepancy_id PK
+        bigint stock_item_id FK
+        varchar status_code "RAISED, WORKED, CLOSED"
+        varchar reason_code
+        decimal quantity_affected
+        varchar remarks
+        datetime raised_at
+        datetime closed_at
+    }
     part {
         bigint part_id PK "see previous diagram"
     }
@@ -173,7 +247,145 @@ erDiagram
 
 Copied part fields are refreshed by events and can be up to 60 seconds old. base_id is an id from the platform; there is no base table in Inventory.
 
-### 3. Ledger and audit log
+## 4. Demand aggregate
+
+A demand is a mechanic's request for parts for a job. These tables are proposed from the disposition table and are not in the DDL yet. Column lists are the main ones only.
+
+```mermaid
+erDiagram
+    demand ||--o{ demand_line : "has lines"
+    demand_line ||--o{ demand_issue : "issued as"
+    demand_line ||--o{ demand_core_return : "core returned as"
+    demand_line ||--o{ demand_owe_back : "owed back as"
+    part ||--o{ demand_line : "requested part"
+    picking_list ||--o{ picking_list_item : "has items"
+    demand_line ||--o{ picking_list_item : "picked as"
+
+    part {
+        bigint part_id PK "see Part diagram"
+    }
+    demand {
+        bigint demand_id PK
+        binary public_id UK
+        bigint base_id "platform id"
+        varchar demand_number "UK with base_id"
+        varchar status_code "REQUESTED, RESERVED, PICKED, ISSUED, CLOSED"
+        varchar work_order_ref "other module, no FK"
+        varchar task_ref "other module, no FK"
+        varchar requested_by_ref "other module, no FK"
+        datetime required_at
+        varchar remarks
+        int row_version
+    }
+    demand_line {
+        bigint demand_line_id PK
+        bigint demand_id FK
+        bigint part_id FK
+        decimal quantity_requested
+        decimal quantity_reserved
+        decimal quantity_issued
+        varchar unit_code
+        varchar status_code
+    }
+    demand_issue {
+        bigint demand_issue_id PK
+        bigint demand_line_id FK
+        bigint stock_item_id "by id"
+        decimal quantity
+        datetime issued_at
+        bigint movement_id "ledger entry, by id"
+    }
+    demand_core_return {
+        bigint demand_core_return_id PK
+        bigint demand_line_id FK
+        decimal quantity
+        datetime returned_at
+    }
+    demand_owe_back {
+        bigint demand_owe_back_id PK
+        bigint demand_line_id FK
+        decimal quantity_owed
+        bool is_settled
+    }
+    picking_list {
+        bigint picking_list_id PK
+        bigint base_id
+        varchar status_code
+        datetime created_at
+    }
+    picking_list_item {
+        bigint picking_list_item_id PK
+        bigint picking_list_id FK
+        bigint demand_line_id FK
+        bigint stock_item_id "by id"
+        decimal quantity_to_pick
+        decimal quantity_picked
+    }
+```
+
+Rules the demand protects:
+- Quantity issued never exceeds quantity requested.
+- Status only moves forward (for example issued cannot go back to requested). The allowed moves are in code.
+- An issue creates a ledger entry in the same transaction.
+- Work order, task and requester are references to other modules. They have no foreign key.
+
+## 5. Stock check aggregate
+
+A stock check is a count of stock at a location. Posting it writes the differences to the ledger.
+
+```mermaid
+erDiagram
+    location ||--o{ stock_check : "counted at"
+    stock_check ||--o{ stock_check_line : "has lines"
+    part ||--o{ min_max_policy : "limits for"
+    location ||--o{ min_max_policy : "limits at"
+
+    location {
+        bigint location_id PK "see Location diagram"
+    }
+    part {
+        bigint part_id PK "see Part diagram"
+    }
+    stock_check {
+        bigint stock_check_id PK
+        binary public_id UK
+        bigint base_id "platform id"
+        bigint location_id FK
+        varchar status_code "PLANNED, COUNTING, REVIEWED, POSTED"
+        date planned_on
+        datetime posted_at
+        bigint posted_by_user_id
+        int row_version
+    }
+    stock_check_line {
+        bigint stock_check_line_id PK
+        bigint stock_check_id FK
+        bigint stock_item_id "by id"
+        decimal expected_quantity "copied when the check starts"
+        decimal counted_quantity
+        decimal difference_quantity "counted minus expected"
+        bigint movement_id "ledger entry made on posting, by id"
+    }
+    min_max_policy {
+        bigint min_max_policy_id PK
+        bigint base_id
+        bigint part_id FK
+        bigint location_id FK
+        decimal minimum_quantity
+        decimal maximum_quantity
+        int row_version
+    }
+```
+
+Rules the stock check protects:
+- Lines can be edited only before the check is posted.
+- Posting writes one ledger entry per line with a difference, all in one transaction.
+- Expected quantity is fixed when the check starts, so later movements do not change what was counted.
+- A posted check cannot be changed. A mistake is fixed by a new check.
+
+min_max_policy is a small planning table kept apart, so changing a limit never locks stock rows.
+
+## 6. Ledger and audit log
 
 ```mermaid
 erDiagram
@@ -211,6 +423,7 @@ erDiagram
 Why no foreign keys: history must survive changes to stock items, inserts stay fast on a very large table, old years can be archived, triggers block updates and deletes, and a wrong entry is fixed by adding a reversing entry.
 
 
+
 # Legacy Table Disposition
 
 This section records what happens to each important legacy table in the new Inventory design. 
@@ -222,7 +435,7 @@ This section records what happens to each important legacy table in the new Inve
 | 1 | `sPart` | Part Catalogue | Keep | `part` (root) | The catalogue entry for every part. It has its own lifecycle (draft, approved, inactive) and every other aggregate refers to it. | 
 | 2 | `sPartClassification` | Part Catalogue | Merge | Flags on `part`, code list kept as lookup | Flags such as shelf-life required and certificate required drive write rules and search, so they sit on the part row. The code list stays for reference. |
 | 3 | `sPartAlternative` | Part Catalogue | Keep | `part_alternative` (child of Part) | One-to-many, and search needs it so a request for one part number can find its approved alternates. `tApprovalID` is externalised to Technical Records. |
-| 4 | `sPartATA`, `sPartModel` | Part Catalogue | Keep | `part_ata`, `part_model` (children) | Used to filter parts by aircraft chapter and model, so they stay searchable child tables. | Medium |
+| 4 | `sPartATA`, `sPartModel` | Part Catalogue | Keep | `part_ata`, `part_model` (children) | Used to filter parts by aircraft chapter and model, so they stay searchable child tables. |
 | 5 | `sPartUnit` | Part Catalogue | Merge | Columns on `part` | Unit of issue is one value per part, so a separate table only adds a join. |
 | 6 | `sStock` | Stock and Receipt | Merge | `stock_item` (root) | The physical item on a shelf. Combined with its receipt line so one row answers "what is this, where is it, and where did it come from". |
 | 7 | `sOrderPartReceipt` | Stock and Receipt | Merge | `stock_item`, with life and warranty data in JSON | Serial, batch, condition and ownership become columns because screens filter by them. Detail-only fields go to JSON. Cost and journal columns are externalised (see row 25). Text copies such as `PartNo` and `Location` are dropped because they duplicate real references. |
@@ -230,7 +443,7 @@ This section records what happens to each important legacy table in the new Inve
 | 9 | `sOrderPartReceiptLifeCode` | Stock and Receipt | Merge | `life_data` JSON on `stock_item` | Life data varies by part type. Fields that need searching, such as hours since new, are exposed as generated columns. |
 | 10 | `sOrderPartReceiptDiscrepancy` | Stock and Receipt | Keep | `receipt_discrepancy` (child) | Discrepancies are raised, worked and closed, so they have their own small lifecycle. |
 | 11 | `sPartWriteOff` | Stock and Receipt | Merge | `movement_ledger_entry` (type `WRITE_OFF` or `WRITE_ON`) | A write-off is a stock adjustment, not a document. The misspelt `WriitenOffDate` maps to the ledger timestamp. | 
-| 12 | `sBaseWarehouseLocation` | Warehouse and Location | Keep | `location` (root) | The bin or shelf, with rules such as serviceable stock only. It is the target of every move. | High |
+| 12 | `sBaseWarehouseLocation` | Warehouse and Location | Keep | `location` (root) | The bin or shelf, with rules such as serviceable stock only. It is the target of every move. |
 | 13 | `sBaseWarehouse`, `sBasePlant`, `sBaseLocation` | Warehouse and Location | Merge | Copied IDs and names on `location` | Short, stable hierarchy. Copying base, plant and warehouse onto each location removes three joins from every stock search. |
 | 14 | `sDemand` | Demand and Issue | Keep | `demand` (root) | A mechanic's request for a job. Has its own status and owns its lines. |
 | 15 | `sDemandPart` | Demand and Issue | Keep | `demand_line` (child) | Keeps request and reservation data. Issue and return detail moves to the children below, and finance columns are externalised. |
@@ -291,7 +504,7 @@ For the duration of the transition, any given base has exactly one system accept
 
 - **Before a base's cut-over:** legacy takes writes. Changes flow into the new tables automatically.
 - **After a base's cut-over:** the new system takes writes for that base, and legacy becomes read-only for that base's inventory data.
-- **Old modules still reading inventory:** a small sync copies changes from the new system back to the legacy tables they read (quantity, location, status). It uses the same outbox pattern as the search sync, so there is one event stream with two consumers. This is the last piece to retire and is listed in the risks.
+- **Old modules still reading inventory:** a small sync copies changes from the new system back to the legacy tables they read (quantity, location, status). It uses the same outbox pattern as the search sync, so there is one event stream with two consumers. This is the last piece to retire.
 - **Routing:** requests are routed by base to the old or new path, so switching a base is a configuration change, not a deployment.
 
 Cut-over steps for one base:
@@ -441,7 +654,40 @@ flowchart LR
 3. The indexer reads the current row from MariaDB, builds the document and sends it to Solr in batches.
 4. Retries with growing waits. After the limit the event goes to a dead-letter queue and raises an alert.
 5. The same event twice is harmless: the document id is the same, so it just overwrites.
-6. Target: searchable within 5 seconds of commit (about 2.5 seconds typical, estimate). Measure it as a lag metric and alert at 3 seconds.
+6. Out-of-order events are handled by version (see below).
+7. Target: searchable within 5 seconds of commit (about 2.5 seconds typical, estimate). Measure it as a lag metric and alert at 3 seconds.
+
+### Out-of-order events
+
+Two events for the same item can arrive in the wrong order, for example after a retry. The rule is that the newest `row_version` always wins.
+
+1. Every document carries the `row_version` from MariaDB, which goes up by 1 on each change.
+2. Solr is set up to compare it on every update (its built-in version check on an external field). An update with a lower or equal version than the stored one is ignored.
+3. The indexer also reads the current row from MariaDB rather than using the event content, so even an old event builds the newest document.
+4. Deletes follow the same rule. A delete carries the row version, so a late old update cannot bring a deleted item back.
+5. If anything still slips through, the nightly comparison of ids and versions repairs it.
+
+Example: version 7 arrives, then a retried version 6. Solr keeps 7 and ignores 6.
+
+## Sizing: collections, shards and replicas
+
+If you know Cosmos DB, the ideas map across like this:
+
+| Solr | Cosmos DB | Meaning |
+|---|---|---|
+| Collection | Container | One searchable set of documents, such as all stock items |
+| Shard | Physical partition | A slice of the collection's documents. Each document lives in exactly one shard |
+| Replica | Replica of a partition | A copy of one shard on another node, for availability and extra read capacity |
+
+The difference: Cosmos picks partitions and replicas for you. In Solr you choose the numbers.
+
+| Collection | Documents | Size | Shards x replicas | Why |
+|---|---|---|---|---|
+| `stock_item` | 6 million | about 12 GB (2 KB each, estimate) | 2 x 3 | 6 GB per shard, room to grow. 3 copies so one can be down for maintenance while another fails |
+| `part` | 1.2 million | about 2.5 GB | 1 x 3 | Small, copies for availability |
+| `location` | a few thousand | under 100 MB | 1 x 3 | Tiny, copies for availability |
+
+Three nodes hold the 6 cores of `stock_item` (2 per node), plus the small collections. A search goes to one replica of each shard and merges the answers. The numbers are estimates until a load test.
 
 ## 3. Searchable index strategy
 
@@ -499,7 +745,15 @@ flowchart LR
 
 Use this for analyzer or schema changes. Small partial updates are enough for the part-description fan-out.
 
-# Field Naming Standard (draft for approval)
+## 6. Assumptions to validate
+
+1. Sizes and load are estimates: 6 million stock documents, about 2 KB each, about 12 GB. Confirm with a load test.
+2. 60 seconds is acceptable for copied part text.
+3. Alternate chains are followed two levels.
+4. Users at several bases can search across them. Rules for seeing another base's stock need a business answer.
+
+
+# Field Naming Standard
 
 One rule set for every layer, so a field reads the same in MariaDB, Solr, the API and the Angular code.
 
@@ -572,7 +826,7 @@ These replace the nine columns repeated on every legacy table. They are mapped b
 
 Same as the database column. Types are chosen by the schema, not by name suffixes, so the Solr field `part_number` is the same text as the column. Derived search fields add a suffix: `_search` for analysed fields, `_key` for normalised exact keys: `part_number_key`, `part_number_search`.
 
-## 7. Renames applied to the DDL (approved)
+## 7. Renames applied to the DDL
 
 | Current name | Problem | Proposed name |
 |---|---|---|
@@ -671,7 +925,7 @@ Search follows the database by a couple of seconds, so the item you just created
 
 - OAuth 2.0 authorisation code with PKCE for the Angular app, and client credentials for other modules. OpenID Connect handles sign-in and discovery.
 - Six scopes: stock, part and location, each with read and write.
-- The token carries a `bases` claim. The server adds `base_id` to every database query and every search filter from that claim, and it intersects any `baseId` the client sends. A client can narrow but never widen. A base outside the claim answers `403` on an explicit request and silently disappears from searches.
+- The token carries a `bases` claim. The server adds `base_id` to every database query and every search filter from that claim, and it intersects any `baseId` the client sends. A client can narrow but never widen. A base outside the claim answers `404` on an explicit request and silently disappears from searches.
 - Scopes say what you may do. Bases say where. Both are checked on every request.
 
 ## Delivery
@@ -880,7 +1134,6 @@ Proving the 5 minute RPO and 1 hour RTO, every quarter in staging at production 
 | 2 | Cut-over and data quality. 6 million stock rows with years of dirty data. Old and new can drift while both run | Rehearse the cut-over three times. Move one base at a time. Counts, checksums and samples at each step. Old system stays read-only as the way back | Rehearsal takes longer than the window |
 | 3 | Search is trusted too much. A late index shows an item as available when it is not | Issue and move are always checked against MariaDB, not Solr. Freshness note on results. Lag alerts. Weekly count comparison of rows and documents | Index lag alerts, count mismatch |
 | 4 | Another base sees data. The base filter is lost in one query | Filter added on the server in the API and inside Solr. Automated tests with users from two bases on every build. Penetration test before go-live | A failing two-base test |
-| 5 | Two months is tight. Six contexts, API, offline and a shared UI library with a small team | Thin slice first: receive and search working end to end by week 3. Offline and secondary screens after. Code generated from the API file. Scope cut list agreed up front | Slice not demoed by week 3 |
 
 
 # AI-Assisted Delivery Plan
@@ -910,7 +1163,7 @@ One file at the repository root. Every coding tool reads it first, so behaviour 
 # AGENTS.md
 
 ## Project
-Inventory modernisation. .NET 8 API, Angular UI, MariaDB, Solr.
+Inventory modernisation. .NET 10 API, Angular UI, MariaDB, Solr.
 Naming: camelCase in API and UI, snake_case in MariaDB and Solr. See docs/naming-standard.md.
 
 ## Do
@@ -965,7 +1218,7 @@ Each skill has one worked example and a small check that runs in the build, so a
 
 Pilot rule (proposal): two weeks, half the endpoints with AI help and half without, then swap. Continue if lead time is at least 25% shorter and defects and rework are no worse. Stop if they rise by more than 20% or production data reaches an outside tool.
 
-## 4. Guardrails
+## 5. Guardrails
 
 | Guardrail | What it means |
 |---|---|
@@ -978,9 +1231,36 @@ Pilot rule (proposal): two weeks, half the endpoints with AI help and half witho
 | Traceability in aviation | The pull request records the tool, the task and the human reviewer. Prompts and the context pack are versioned. Anything touching traceability, life data or certificates has a named responsible person and a release record |
 | Not for airworthiness decisions | AI never decides serviceability, release or life limits. It can draft and flag. Certified people decide and sign |
 
-## 5. In the product (optional)
+## 6. In the product (optional)
 
 - Natural-language stock search: the user types a sentence, the API turns it into the existing filters, shown as chips the user can edit. No stock data is sent.
 - Count-anomaly flags: a nightly job ranks odd stock counts with a reason. It writes nothing to stock, and a person recounts or dismisses.
 
 Both are suggestions only. Neither decides airworthiness.
+
+# How I used AI
+
+I used one tool for this assignment: Perplexity Computer. I gave it the two source documents, the assignment brief and the legacy schema workbook (Attachment A). Then I worked through the tasks one at a time, in a series of prompts.
+
+## What I used it for
+
+- Explaining the domain. I have no aviation or inventory background, so I asked it to explain tables, rules and terms in plain language.
+- Drafting the first versions of the bounded contexts, aggregates, disposition table, migration approach, MariaDB DDL, Solr and sync design, naming standard and sample mapping, OpenAPI file, architecture, UI library and AI delivery plan.
+- Producing the diagrams and the Mermaid versions of the ERD and architecture.
+
+## How I checked it
+
+- After each draft I compared it against the requirement in the brief and tested whether it made sense, asking follow-up questions where I didn't understand it. Examples are BIGINT versus GUID, how row_version and If-Match work, why the idempotency key in header was suggested etc.
+- I ran the generated files myself. I hit and reported errors, such as the `sensitive` column in the DDL and the OpenAPI example on line 319, and had them fixed.
+- I reviewed the final document against the brief and found leftover text, contradictions and missing parts, then had those corrected.
+
+## What I changed or decided myself
+
+- I chose the direction on the key choices: six contexts, camelCase for the API and UI with snake_case for MariaDB and Solr, and a generic migration approach.
+- Architecture:
+  - I advised a modular monolith for the Inventory module, because the team is small and the timeline is two months.
+  - I suggested an async worker to build the read model in Solr, so writes never wait on search.
+  - I had the API gateway validate tokens and enforce rate limits and quotas, with the API checking again for base access.
+  - I asked for `row_version` checks on both reads and writes. Reads carry the version in the ETag, and updates are rejected with a 412 when it is stale.
+- I asked for simpler versions where I thought the draft was too complicated, including the Solr write-up, the AI plan, and the offline design.
+- I listed the places where meaning is an assumption, because the domain knowledge isn't mine.
